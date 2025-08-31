@@ -1,0 +1,83 @@
+name: Run Downloader (AppNext → Drive)
+
+on:
+  schedule:
+    - cron: "30 16 * * *"    # 13:30 BRT
+    - cron: "0 2 * * *"      # 23:00 BRT
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      APPNEXT_REDE: ${{ secrets.APPNEXT_REDE }}
+      APPNEXT_USER: ${{ secrets.APPNEXT_USER }}
+      APPNEXT_PASS: ${{ secrets.APPNEXT_PASS }}
+      DRIVE_REMOTE: ${{ secrets.DRIVE_REMOTE }}
+      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      DRIVE_FILE_NAME: ${{ secrets.DRIVE_FILE_NAME }}
+      DATA_INICIO: ${{ secrets.DATA_INICIO }}
+      DATA_FIM: ${{ secrets.DATA_FIM }}
+      TEMPLATE_XLSX: ${{ secrets.TEMPLATE_XLSX }}
+      TEMPLATE_HEADER_ROW: ${{ secrets.TEMPLATE_HEADER_ROW }}
+      APPNEXT_LOJA_ID_DESTINO: ${{ secrets.APPNEXT_LOJA_ID_DESTINO }}
+      RCLONE_TOKEN: ${{ secrets.RCLONE_TOKEN }}
+      RCLONE_CONFIG_GDRIVE_SERVICE_ACCOUNT_FILE: ${{ secrets.RCLONE_CONFIG_GDRIVE_SERVICE_ACCOUNT_FILE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps (rclone + Playwright deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          python -m pip install -r requirements.txt
+          python -m pip install playwright black
+          python -m playwright install --with-deps chromium
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          {
+            echo "[GDRIVE]"
+            echo "type = drive"
+            echo "scope = drive"
+            if [ -n "${RCLONE_TOKEN}" ]; then
+              echo "token = ${RCLONE_TOKEN}"
+            fi
+          } > ~/.config/rclone/rclone.conf
+
+          if [ -n "${RCLONE_CONFIG_GDRIVE_SERVICE_ACCOUNT_FILE}" ]; then
+            echo "${RCLONE_CONFIG_GDRIVE_SERVICE_ACCOUNT_FILE}" | base64 -d > /tmp/sa.json
+            echo "service_account_file = /tmp/sa.json" >> ~/.config/rclone/rclone.conf
+          fi
+
+          echo "::group::rclone.conf"
+          sed 's/token = .*/token = ***REDACTED***/' ~/.config/rclone/rclone.conf || true
+          echo "::endgroup::"
+
+      - name: Normalize Python file (fix tabs/NBSP)
+        run: |
+          python - <<'PY'
+          p='nextsoft_export_to_drive.py'
+          b=open(p,'rb').read()
+          b=b.replace(b'\r\n',b'\n').replace(b'\r',b'\n')   # CRLF -> LF
+          b=b.replace(b'\t', b'    ')                       # TAB -> 4 espaços
+          b=b.replace(b'\xc2\xa0', b' ')                    # NBSP -> espaço normal
+          open(p,'wb').write(b)
+          PY
+
+      - name: Format with black
+        run: |
+          black -q nextsoft_export_to_drive.py
+
+      - name: Run script
+        run: python nextsoft_export_to_drive.py
