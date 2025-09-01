@@ -2,8 +2,7 @@ name: Run Downloader (AppNext → Drive)
 
 on:
   schedule:
-    - cron: "30 16 * * *"    # 13:30 BRT
-    - cron: "0 2 * * *"      # 23:00 BRT
+    - cron: "0 4 1,16 * *"   # 04:00 UTC → 01:00 BRT, apenas nos dias 1 e 16
   workflow_dispatch:
 
 jobs:
