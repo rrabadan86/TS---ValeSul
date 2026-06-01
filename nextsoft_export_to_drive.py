@@ -5,7 +5,7 @@
 # 3) Vendas > Vendedor Analítico
 # 4) Abre filtros (estabiliza grid)
 # 5) Tenta exportar; se URL direta não for capturada (blob/POST), FALLBACK:
-#    refaz a chamada de dados com dataInicial/dataFinal desejadas e gera o Excel localmente
+#    refaz a chamada de dados em janelas mensais e gera o Excel localmente
 # 6) Envia o arquivo ao Google Drive via rclone
 
 import os
@@ -14,14 +14,16 @@ import subprocess
 import traceback
 import shutil
 import json
-import unicodedata
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 
 # ================= LOG =================
 def log(msg: str):
@@ -276,19 +278,29 @@ def replay_export_with_dates(page, destino_path: Path):
     download.save_as(destino_path.as_posix())
     log(f"Arquivo exportado (período aplicado): {destino_path.name}")
 
-# --------- FALLBACK: baixar JSON e gerar Excel ----------
+# --------- FALLBACK: baixar JSON em janelas mensais ----------
+def _janelas_mensais(ini_dt, fim_dt):
+    janelas, cur = [], ini_dt
+    while cur <= fim_dt:
+        if cur.month == 12:
+            prox = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            prox = cur.replace(month=cur.month + 1, day=1)
+        fim_janela = min(prox - timedelta(seconds=1), fim_dt)
+        janelas.append((cur, fim_janela))
+        cur = prox
+    return janelas
+
+
 def fetch_report_json_with_dates(page):
     if not Captured.filtro_url:
         raise RuntimeError("Endpoint de dados não capturado ainda.")
     parsed = urlparse(Captured.filtro_url)
-    qs = parse_qs(parsed.query)
-    qs["dataInicial"] = [FMT_JSON_INI]
-    qs["dataFinal"] = [FMT_JSON_FIM]
+    base_qs = parse_qs(parsed.query)
     if LOJA_ID_DESTINO:
-        qs["lojaId"] = [LOJA_ID_DESTINO]
-    target_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+        base_qs["lojaId"] = [LOJA_ID_DESTINO]
     headers = {**_clean_headers(Captured.filtro_headers or {})}
-    log(f"[dados-replay] GET -> {target_url}")
+
     js_code = """
     async ([url, headers]) => {
         const res = await fetch(url, { method: "GET", headers });
@@ -296,229 +308,221 @@ def fetch_report_json_with_dates(page):
         return { ok: res.ok, status: res.status, text };
     }
     """
-    result = page.evaluate(js_code, [target_url, headers])
-    if not result.get("ok"):
-        raise RuntimeError(f"Falha ao obter dados: HTTP {result.get('status')}")
-    try:
-        data = json.loads(result["text"])
-    except Exception as e:
-        raise RuntimeError(f"Não consegui decodificar o JSON da API: {e}") from e
-    return data
 
-# ----------------- Normalização/Excel -----------------
-MAPEAMENTO_COLUNAS = {
-    "dataVenda": "Data",
-    "numeroCupom": "Número Cupom",
-    "qtdItens": "Qtd. Itens no Cupom",
-    "quantidade": "Qtd. Itens no Cupom",
-    "produto.nome": "Descrição",
-    "produto": "Descrição",
-    "item.descricao": "Descrição",
-    "subGrupo.nome": "Sub-Grupo",
-    "subgrupo.nome": "Sub-Grupo",
-    "subGrupo": "Sub-Grupo",
-    "subgrupo": "Sub-Grupo",
-    "valorUnitario": "Valor Unitário",
-    "precoUnitario": "Valor Unitário",
-    "valorTotal": "Valor Total",
-    "totalItem": "Valor Total",
-    "valorLiquido": "Valor Total",
-}
+    todos = []
+    for jini, jfim in _janelas_mensais(INI_DT, FIM_DT):
+        qs = dict(base_qs)
+        qs["dataInicial"] = [jini.strftime("%Y-%m-%dT%H:%M:%S.000Z")]
+        qs["dataFinal"]   = [jfim.strftime("%Y-%m-%dT%H:%M:%S.000Z")]
+        target_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+        log(f"[dados-replay] {jini:%d/%m/%Y} -> {jfim:%d/%m/%Y}")
 
-TEMPLATE_ALIASES = {
-    "data": ["dataVenda", "data", "dataHora", "createdAt", "dt_venda"],
-    "numero cupom": ["numeroCupom", "cupom.numero", "numero", "documento", "numeroDocumento"],
-    "qtd itens no cupom": ["qtdItens", "quantidade", "qtde", "qtd", "itens", "itensQuantidade"],
-    "descricao": ["descricao", "produto", "produto.descricao", "produtoNome", "item.descricao"],
-    "sub-grupo": ["subGrupo", "subgrupo", "subGrupo.nome", "subgrupo.nome"],
-    "valor unitario": ["valorUnitario", "precoUnitario", "valor.unitario", "preco"],
-    "valor total": ["valorTotal", "valor.total", "total", "totalItem", "valorLiquido"],
-    "vendedor": ["vendedor.nome", "vendedor", "vendedorNome", "colaborador", "usuario"],
-    "grupo": ["grupo.nome", "grupo", "nomeGrupo"],
-}
-
-DATE_HEADER_HINTS = {"data", "data venda", "data de venda", "emissao", "data emissao", "data emissão"}
-
-
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return " ".join("".join(ch if ch.isalnum() else " " for ch in s).split())
-
-
-def _is_iso_datetime_str(x: str) -> bool:
-    if not isinstance(x, str):
-        return False
-    return len(x) >= 19 and x[4] == "-" and x[7] == "-" and ("T" in x)
-
-
-def _format_date_columns(df):
-    import pandas as pd
-
-    for col in df.columns:
-        ncol = _norm(col)
-        if (ncol in DATE_HEADER_HINTS) or any(h in ncol for h in DATE_HEADER_HINTS):
-            try:
-                df[col] = pd.to_datetime(df[col], errors="coerce", utc=False)
-                if df[col].isna().all():
-                    df[col] = df[col].apply(
-                        lambda v: pd.to_datetime(v, errors="coerce") if _is_iso_datetime_str(str(v)) else pd.NaT
-                    )
-                df[col] = df[col].dt.strftime("%d/%m/%Y")
-            except Exception:
-                pass
-    return df
-
-
-def _load_template_headers(template_path: str) -> list[str]:
-    import pandas as pd
-
-    df_t = pd.read_excel(template_path, nrows=0, header=TEMPLATE_HEADER_ROW - 1, engine="openpyxl")
-    return list(df_t.columns)
-
-
-def _build_dataframe_with_template(df, template_cols: list[str]):
-    import pandas as pd
-
-    norm_template = {_norm(c): c for c in template_cols}
-
-    idx_df_norm = {}
-    for c in df.columns:
-        idx_df_norm.setdefault(_norm(str(c)), []).append(c)
-
-    # 1) Mapeamentos diretos
-    mapping = {}
-    for k_json, k_model in MAPEAMENTO_COLUNAS.items():
-        if k_json in df.columns and k_model in template_cols:
-            mapping[k_json] = k_model
-
-    usados_df = set(mapping.keys())
-    usados_model = set(mapping.values())
-
-    # 2) Aliases por nome
-    for col_model in template_cols:
-        if col_model in usados_model:
-            continue
-        nmodel = _norm(col_model)
-        for cand in TEMPLATE_ALIASES.get(nmodel, []):
-            if cand in df.columns and cand not in usados_df:
-                mapping[cand] = col_model
-                usados_df.add(cand)
-                usados_model.add(col_model)
+        result = None
+        for tentativa in range(1, 4):
+            result = page.evaluate(js_code, [target_url, headers])
+            if result.get("ok"):
                 break
-            for alt in idx_df_norm.get(_norm(cand), []):
-                if alt not in usados_df:
-                    mapping[alt] = col_model
-                    usados_df.add(alt)
-                    usados_model.add(col_model)
-                    break
-            if col_model in usados_model:
-                break
+            log(f"  HTTP {result.get('status')} (tentativa {tentativa}/3)")
+            page.wait_for_timeout(2000 * tentativa)
 
-    # 3) Heurística por similaridade simples
-    for c in df.columns:
-        if c in usados_df:
-            continue
-        nc = _norm(str(c))
-        if nc in norm_template and norm_template[nc] not in usados_model:
-            mapping[c] = norm_template[nc]
-            usados_df.add(c)
-            usados_model.add(norm_template[nc])
-            continue
-        for dst in [dst for nk, dst in norm_template.items() if nc and (nc in nk or nk in nc)]:
-            if dst not in usados_model:
-                mapping[c] = dst
-                usados_df.add(c)
-                usados_model.add(dst)
-                break
-
-    # 4) Construção do DF final
-    out = pd.DataFrame()
-    vazias = []
-    for col_model in template_cols:
-        origem = next((src for src, dst in mapping.items() if dst == col_model), None)
-        if origem is None and col_model in df.columns:
-            origem = col_model
-        if origem is not None:
-            out[col_model] = df[origem]
-        else:
-            out[col_model] = ""
-            vazias.append(col_model)
-
-    if vazias:
-        log(f"[mapeamento] Colunas do MODELO sem origem (vazias): {', '.join(vazias)}")
-    return out
-
-
-def _apply_template_top_rows(out_path: Path):
-    from openpyxl import load_workbook
-
-    if TEMPLATE_HEADER_ROW <= 1:
-        return
-
-    wb_out = load_workbook(out_path.as_posix())
-    ws_out = wb_out.active
-    wb_tpl = load_workbook(TEMPLATE_XLSX)
-    ws_tpl = wb_tpl.active
-
-    # Inserir linhas superiores
-    for _ in range(TEMPLATE_HEADER_ROW - 1):
-        ws_out.insert_rows(1)
-
-    # Copiar conteúdo das linhas de cabeçalho do template
-    for r in range(1, TEMPLATE_HEADER_ROW):
-        for c, cell in enumerate(ws_tpl[r], start=1):
-            ws_out.cell(row=r, column=c, value=cell.value)
-
-    # Mesclas que pertençam às linhas superiores
-    for rng in ws_tpl.merged_cells.ranges:
-        if rng.max_row <= (TEMPLATE_HEADER_ROW - 1):
-            ws_out.merge_cells(
-                start_row=rng.min_row,
-                start_column=rng.min_col,
-                end_row=rng.max_row,
-                end_column=rng.max_col,
+        if not result or not result.get("ok"):
+            raise RuntimeError(
+                f"Falha na janela {jini:%d/%m} - {jfim:%d/%m}: "
+                f"HTTP {result.get('status') if result else '??'}"
             )
 
-    # Largura de colunas (se houver)
+        try:
+            parcial = json.loads(result["text"])
+        except Exception as e:
+            raise RuntimeError(f"JSON inválido na janela {jini:%d/%m}: {e}") from e
+
+        if isinstance(parcial, list):
+            todos.extend(parcial)
+        elif isinstance(parcial, dict):
+            for key in ("items", "data", "resultado", "rows", "content"):
+                if isinstance(parcial.get(key), list):
+                    todos.extend(parcial[key])
+                    break
+            else:
+                todos.append(parcial)
+
+    log(f"[dados-replay] total de linhas agregadas: {len(todos)}")
+    return todos
+
+# ----------------- GERAÇÃO DO EXCEL (idêntico ao importacaoA.xlsx) -----------------
+# Larguras EXATAS extraídas do modelo
+COL_WIDTHS = {
+    "A": 32.4, "B": 18.9, "C": 13.5, "D": 16.2, "E": 25.65, "F": 18.9,
+    "G": 54.0, "H": 40.5, "I": 52.65, "J": 54.0, "K": 13.5, "L": 18.9,
+    "M": 22.95, "N": 14.85, "O": 16.2,
+}
+
+# Layout do arquivo final, na ordem das colunas A..O:
+#   (cabeçalho, [campos candidatos vindos da API], tipo, env_fallback)
+# tipo: "text" | "num" | "data_br"
+# >>> AJUSTE os nomes de campo conforme o log "[debug] colunas do JSON normalizado:".
+COLUNAS = [
+    ("Loja",                ["loja"],                         "text",    "APPNEXT_LOJA_DESTINO"),
+    ("CNPJ",                ["cnpj"],                         "text",    "APPNEXT_LOJA_CNPJ"),
+    ("Data",                ["data"],                         "data_br", None),
+    ("Número Cupom",        ["numeroCupom"],                  "text",    None),
+    # CONFIRMADO pela amostra: valorTotal = valorUnitario * quantidadeItem,
+    # logo 'quantidade' = total de itens do cupom (coluna E) e
+    # 'quantidadeItem' = qtd da linha (coluna "Quantidade", K).
+    ("Qtd. Itens no Cupom", ["quantidade", "quantidadeItem"], "num",     None),
+    ("Código Produto",      ["codigo"],                       "text",    None),
+    ("Descrição",           ["produto"],                      "text",    None),
+    ("Grupo",               ["grupo"],                        "text",    None),
+    ("Sub-Grupo",           ["subGrupo"],                     "text",    None),
+    ("Categorias",          ["categorias"],                   "text",    None),
+    ("Quantidade",          ["quantidadeItem", "quantidade"], "num",     None),
+    ("Valor Unitário",      ["valorUnitario"],                "num",     None),
+    ("Desconto Unitário",   ["desconto"],                     "num",     None),
+    ("Valor Total",         ["valorTotal"],                   "num",     None),
+    ("Vendedor",            ["vendedor"],                     "text",    None),
+]
+
+
+def _pick(rec, candidatos):
+    """Primeiro campo presente e não vazio (trata NaN do pandas)."""
+    for c in candidatos:
+        if c in rec:
+            v = rec[c]
+            if v is None:
+                continue
+            if isinstance(v, float) and v != v:  # NaN
+                continue
+            if v == "":
+                continue
+            return v
+    return None
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return int(v) if float(v).is_integer() else v
     try:
-        for key, dim in ws_tpl.column_dimensions.items():
-            if dim.width:
-                ws_out.column_dimensions[key].width = dim.width
+        n = float(str(v).replace(",", "."))
+        return int(n) if n.is_integer() else n
+    except Exception:
+        return v
+
+
+def _data_br(v):
+    """Converte a data da API para a string 'dd/mm/yyyy' (igual ao modelo).
+    Se vier ISO com fuso (…Z), converte para horário de Brasília (-03:00)
+    antes de extrair o dia, evitando virar o dia por causa do UTC."""
+    if v is None or v == "":
+        return ""
+    s = str(v).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone(timedelta(hours=-3)))
+        return dt.strftime("%d/%m/%Y")
     except Exception:
         pass
+    m = re.match(r"(\d{2})/(\d{2})/(\d{4})", s)
+    if m:
+        return s[:10]
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+    return s
 
-    wb_out.save(out_path.as_posix())
+
+def _texto(raw):
+    if raw is None:
+        return ""
+    if isinstance(raw, list):
+        partes = []
+        for x in raw:
+            if isinstance(x, dict):
+                partes.append(str(x.get("nome") or x.get("descricao") or x))
+            else:
+                partes.append(str(x))
+        return ", ".join(partes)
+    return str(raw).strip()
 
 
 def write_excel_from_json(data, out_path: Path):
     import pandas as pd
 
+    # 1) extrai a lista de linhas
     if isinstance(data, list):
         rows = data
     elif isinstance(data, dict):
         rows = None
         for key in ("items", "data", "resultado", "rows", "content"):
-            if key in data and isinstance(data[key], list):
+            if isinstance(data.get(key), list):
                 rows = data[key]
                 break
-        rows = rows or [data]
+        rows = rows if rows is not None else [data]
     else:
-        rows = [{"raw": data}]
+        rows = []
 
-    df_raw = pd.json_normalize(rows)
-    log("[debug] colunas do JSON normalizado: " + ", ".join(df_raw.columns.astype(str).tolist()))
+    df = pd.json_normalize(rows)
+    log("[debug] colunas do JSON normalizado: " + ", ".join(map(str, df.columns)))
+    if len(df):
+        amostra = {k: df.iloc[0][k] for k in df.columns}
+        log("[debug] 1a linha (amostra): "
+            + json.dumps(amostra, ensure_ascii=False, default=str)[:1500])
+    registros = df.to_dict("records")
 
-    template_cols = _load_template_headers(TEMPLATE_XLSX)
-    df_final = _build_dataframe_with_template(df_raw, template_cols)
-    df_final = _format_date_columns(df_final)
+    # 2) monta a planilha do zero, igual ao importacaoA.xlsx
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
 
-    df_final.to_excel(out_path.as_posix(), index=False, engine="openpyxl")
-    _apply_template_top_rows(out_path)
-    log(f"Arquivo salvo com estrutura do modelo: {out_path.name}")
+    ts = datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
+    ws["A1"] = f"Vendas Por Vendedor - Listagem Vendedor Analítico ( {ts} )"
+    ws["A1"].font = Font(name="Calibri", size=11)
+    ws.merge_cells("A1:O1")
 
-# -------------- TROCAR LOJA --------------
+    hdr_font = Font(name="Calibri", size=11, bold=True)
+    hdr_align = Alignment(horizontal="center")
+    for j, (header, _c, _t, _f) in enumerate(COLUNAS, start=1):
+        c = ws.cell(row=2, column=j, value=header)
+        c.font = hdr_font
+        c.alignment = hdr_align
+
+    body_font = Font(name="Calibri", size=11)
+    preenchidas = set()
+    r = 3
+    for rec in registros:
+        for j, (header, cands, tipo, fb) in enumerate(COLUNAS, start=1):
+            raw = _pick(rec, cands)
+            if raw is None and fb:
+                raw = os.getenv(fb, "") or None
+            if raw is not None:
+                preenchidas.add(header)
+
+            if tipo == "data_br":
+                val = _data_br(raw)
+            elif tipo == "num":
+                val = _num(raw)
+            else:
+                val = _texto(raw)
+
+            cell = ws.cell(row=r, column=j, value=val)
+            cell.font = body_font
+        r += 1
+
+    for col, w in COL_WIDTHS.items():
+        ws.column_dimensions[col].width = w
+
+    vazias = [h for (h, _c, _t, _f) in COLUNAS if h not in preenchidas]
+    if vazias:
+        log("[mapeamento] colunas SEM origem na API (saíram VAZIAS em TODAS as linhas, ajustar COLUNAS): "
+            + ", ".join(vazias))
+
+    wb.save(out_path.as_posix())
+    log(f"Arquivo salvo no layout do modelo: {out_path.name} ({len(registros)} linhas de dados)")
+
 # -------------- TROCAR LOJA --------------
 def trocar_loja(page, loja_nome=None):
     """
@@ -637,7 +641,7 @@ def main():
                 pass
 
             # 2) Trocar loja via secret (habilite se quiser forçar)
-            # trocar_loja(page, os.getenv("APPNEXT_LOJA_DESTINO"))
+            trocar_loja(page, os.getenv("APPNEXT_LOJA_DESTINO"))
 
             # 3) Ir para Vendas > Vendedor Analítico
             step("3) Menu: Vendas → Vendedor Analítico")
