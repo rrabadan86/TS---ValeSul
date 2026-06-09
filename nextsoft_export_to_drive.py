@@ -144,8 +144,44 @@ def _click_first(page, selectors):
     return False
 
 
+def wait_for_titulo_rel(page, timeout=40000):
+    """Aguarda qualquer variação do título do relatório Vendedor Analítico."""
+    sels = [
+        SEL["titulo_rel"],
+        "h1:has-text('Vendedor')",
+        "h2:has-text('Vendedor')",
+        ".page-title:has-text('Vendedor')",
+        "text=Vendedor Anal",
+    ]
+    for sel in sels:
+        try:
+            page.wait_for_selector(sel, timeout=timeout)
+            return
+        except Exception:
+            pass
+    raise TimeoutError(f"Título de Vendedor Analítico não encontrado após {timeout}ms")
+
+
 def goto_vendedor_analitico_via_menu(page):
-    # abre o menu Vendas
+    # --- tentativa 1: navegação direta via URL ---
+    base = page.url.split("/#/")[0] if "/#/" in page.url else "https://www.appnext.com.br"
+    direct_url = f"{base}/#/loja/vendas/vendedor-analitico"
+    try:
+        log(f"[nav] tentando URL direta -> {direct_url}")
+        page.goto(direct_url, wait_until="load", timeout=60_000)
+        try:
+            page.wait_for_url("**/loja/vendas/**vendedor**", timeout=15000)
+        except PWTimeout:
+            pass
+        try:
+            wait_for_titulo_rel(page, timeout=15000)
+            return  # sucesso via URL direta
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"[nav] URL direta falhou: {e}")
+
+    # --- tentativa 2: via menu ---
     for sel in [s.strip() for s in SEL["menu_vendas"].split(",")]:
         try:
             loc = page.locator(sel).first
@@ -158,7 +194,6 @@ def goto_vendedor_analitico_via_menu(page):
                 break
         except Exception:
             continue
-    # clica no item Vendedor Analítico
     for sel in [s.strip() for s in SEL["item_vendedor_analitico"].split(",")]:
         try:
             it = page.locator(sel).first
@@ -171,7 +206,7 @@ def goto_vendedor_analitico_via_menu(page):
     try:
         page.wait_for_url("**/loja/vendas/**vendedor**", timeout=30000)
     except PWTimeout:
-        page.wait_for_selector(SEL["titulo_rel"], timeout=20000)
+        wait_for_titulo_rel(page, timeout=20000)
 
 
 def open_filters_pane(page):
@@ -610,6 +645,7 @@ def main():
             user_data_dir=str(Path.cwd() / "pw_state"),
             headless=True,
             accept_downloads=True,
+            ignore_https_errors=True,
             viewport={"width": 1600, "height": 950},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
         )
@@ -646,7 +682,7 @@ def main():
             # 3) Ir para Vendas > Vendedor Analítico
             step("3) Menu: Vendas → Vendedor Analítico")
             goto_vendedor_analitico_via_menu(page)
-            page.wait_for_selector(SEL["titulo_rel"], timeout=40000)
+            wait_for_titulo_rel(page, timeout=40000)
             log("Tela confirmada.")
 
             # 4) Abrir filtros e estabilizar grid
