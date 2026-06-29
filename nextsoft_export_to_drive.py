@@ -15,6 +15,8 @@ import traceback
 import shutil
 import json
 import re
+import threading           # <<< NOVO: usado pelo watchdog global
+import time                # <<< NOVO: usado pelo watchdog global
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -37,6 +39,19 @@ def step(title: str):
     log("=" * 70)
 
 
+# ============== WATCHDOG GLOBAL (NOVO) ==============
+# Mata o processo se ele exceder o tempo máximo, não importa onde
+# o Playwright esteja travado. Roda numa thread separada (daemon).
+def start_watchdog(max_seconds: int):
+    def _killer():
+        time.sleep(max_seconds)
+        log(f"### TIMEOUT GLOBAL: excedeu {max_seconds}s ({max_seconds // 60} min). Abortando. ###")
+        # 124 é o código convencional de timeout; faz o job FALHAR no Actions
+        os._exit(124)
+    threading.Thread(target=_killer, daemon=True).start()
+    log(f"[watchdog] ativo: aborta em {max_seconds}s ({max_seconds // 60} min).")
+
+
 load_dotenv()
 
 # ================ CONFIG ================
@@ -48,7 +63,27 @@ DRIVE_REMOTE = os.getenv("DRIVE_REMOTE", "GDRIVE:")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
 DRIVE_FILE_NAME = os.getenv("DRIVE_FILE_NAME", "importacaoA.xlsx").strip()
 
-DATA_INICIO = os.getenv("DATA_INICIO", "01/06/2025").strip()
+# Tempo máximo total do processo, em segundos (default 7 min = 420s).
+# Pode ser sobrescrito via secret/variável MAX_RUNTIME_SECONDS.
+MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "420"))
+
+# ---- Datas ----
+# Lógica:
+#  - Se DATA_INICIO for definida explicitamente no ambiente, usa ela.
+#  - Senão, se DIAS_JANELA for definida, calcula uma janela deslizante
+#    (ex.: últimos 60 dias) -> mantém o tempo de execução estável.
+#  - Senão, mantém o comportamento antigo (data fixa 01/06/2025).
+DIAS_JANELA = os.getenv("DIAS_JANELA", "").strip()
+_data_inicio_env = os.getenv("DATA_INICIO", "").strip()
+
+if _data_inicio_env:
+    DATA_INICIO = _data_inicio_env
+elif DIAS_JANELA:
+    _dias = int(DIAS_JANELA)
+    DATA_INICIO = (datetime.now() - timedelta(days=_dias)).strftime("%d/%m/%Y")
+else:
+    DATA_INICIO = "01/06/2025"  # comportamento original preservado
+
 DATA_FIM = os.getenv("DATA_FIM", "").strip()  # vazio => hoje 23:59:59
 
 TEMPLATE_XLSX = os.getenv("TEMPLATE_XLSX", "importacaoA.xlsx")
@@ -91,6 +126,8 @@ FMT_JSON_FIM = FIM_DT.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 FMT_BR_INI = INI_DT.strftime("%d/%m/%Y, %H:%M:%S")
 FMT_BR_FIM = FIM_DT.strftime("%d/%m/%Y, %H:%M:%S")
 
+log(f"[datas] período: {FMT_BR_INI}  ->  {FMT_BR_FIM}")
+
 # -------- seletores ----------
 SEL = {
     # login
@@ -102,7 +139,7 @@ SEL = {
     "menu_vendas": "nav >> text=Vendas, header >> text=Vendas, a[href*='vendas']:has-text('Vendas'), button:has-text('Vendas')",
     "item_vendedor_analitico": "a[href*='vendedor-analitico'], a:has-text('Vendedor Anal'), [role='menuitem']:has-text('Vendedor Anal'), li:has-text('Vendedor Anal')",
     # tela alvo
-    "titulo_rel": "text=Listagem de Vendedor Analítico",
+    "titulo_rel": "text=Listagem de Vendedor Anal",
     # filtros / grid / export
     "btn_filtros": "[title*='Filtro'], [aria-label*='Filtro'], button:has(i.mdi-filter), button:has(i.fa-filter), button:has-text('Filtros')",
     "pane_filtros": "#filtrosForm",
@@ -153,9 +190,10 @@ def wait_for_titulo_rel(page, timeout=40000):
         ".page-title:has-text('Vendedor')",
         "text=Vendedor Anal",
     ]
+    deadline = timeout
     for sel in sels:
         try:
-            page.wait_for_selector(sel, timeout=timeout)
+            page.wait_for_selector(sel, timeout=deadline)
             return
         except Exception:
             pass
@@ -301,7 +339,8 @@ def replay_export_with_dates(page, destino_path: Path):
     qs["dataFinal"] = [FMT_JSON_FIM]
     target_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
     log(f"[export-replay] GET -> {target_url}")
-    with page.expect_download(timeout=180000) as dl:
+    # timeout reduzido de 180s -> 90s
+    with page.expect_download(timeout=90_000) as dl:
         page.evaluate(
             """
             (url) => { const a=document.createElement('a'); a.href=url; a.target='_blank';
@@ -353,12 +392,13 @@ def fetch_report_json_with_dates(page):
         log(f"[dados-replay] {jini:%d/%m/%Y} -> {jfim:%d/%m/%Y}")
 
         result = None
-        for tentativa in range(1, 4):
+        # retries reduzidos: 2 tentativas e backoff menor (cabe no orçamento de tempo)
+        for tentativa in range(1, 3):
             result = page.evaluate(js_code, [target_url, headers])
             if result.get("ok"):
                 break
-            log(f"  HTTP {result.get('status')} (tentativa {tentativa}/3)")
-            page.wait_for_timeout(2000 * tentativa)
+            log(f"  HTTP {result.get('status')} (tentativa {tentativa}/2)")
+            page.wait_for_timeout(1000 * tentativa)
 
         if not result or not result.get("ok"):
             raise RuntimeError(
@@ -625,21 +665,28 @@ def trocar_loja(page, loja_nome=None):
         return False
 
 # -------- Navegação resiliente: goto com retries --------
-def goto_login_with_retries(page, url, tries=5):
+def goto_login_with_retries(page, url, tries=3):
+    # tries reduzido de 5 -> 3 e timeout de 240s -> 60s por tentativa.
+    # Antes, no pior caso, o login sozinho podia consumir ~20 min.
     alt_urls = {url, url.replace("https://www.", "https://")}
     for i in range(1, tries + 1):
         for target in alt_urls:
             try:
                 log(f"[goto] tentativa {i}/{tries} -> {target}")
-                page.goto(target, wait_until="load", timeout=240_000)
+                page.goto(target, wait_until="load", timeout=60_000)
                 return
             except Exception as e:
                 log(f"[goto] falhou em {target}: {e}")
-        page.wait_for_timeout(i * 5000)  # backoff progressivo
-    page.goto(url, wait_until="load", timeout=240_000)
+        page.wait_for_timeout(i * 3000)  # backoff progressivo (menor)
+    page.goto(url, wait_until="load", timeout=60_000)
 
 # ================ MAIN =================
 def main():
+    # Liga o watchdog ANTES de qualquer coisa pesada.
+    start_watchdog(MAX_RUNTIME_SECONDS)
+
+    ok = False  # <<< NOVO: controla se o fluxo terminou com sucesso de verdade
+
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             user_data_dir=str(Path.cwd() / "pw_state"),
@@ -650,8 +697,9 @@ def main():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(180_000)
-        page.set_default_navigation_timeout(300_000)
+        # timeouts reduzidos: 180s -> 30s (ação) e 300s -> 60s (navegação)
+        page.set_default_timeout(30_000)
+        page.set_default_navigation_timeout(60_000)
 
         page.on("console", lambda m: log(f"[console] {m.type}: {m.text}"))
         page.on("pageerror", lambda e: log(f"[pageerror] {e}"))
@@ -698,7 +746,8 @@ def main():
             step("5) Exportar Excel (tentar capturar URL)")
             captured_export_ok = False
             try:
-                with page.expect_download(timeout=180000) as dl_tmp:
+                # timeout reduzido de 180s -> 90s
+                with page.expect_download(timeout=90_000) as dl_tmp:
                     page.locator(SEL["excel_btn"]).first.click()
                 tmp_download = dl_tmp.value
                 tmp_path = Path.cwd() / f"_tmp_export_{TS}.xlsx"
@@ -729,6 +778,8 @@ def main():
             rclone_copy_latest(LOCAL_OUT)
             log("Upload concluído.")
 
+            ok = True  # <<< só chega aqui se TUDO acima deu certo
+
         except Exception:
             log("### ERRO DURANTE O FLUXO ###")
             print(traceback.format_exc())
@@ -741,6 +792,12 @@ def main():
     step("FINALIZADO")
     log(f"Local: {LOCAL_OUT.resolve()}")
     log(f"Drive: {DRIVE_FILE_NAME}  (pasta ID {DRIVE_FOLDER_ID})")
+
+    # <<< NOVO: faz o job FALHAR de verdade se algo deu errado.
+    # Antes, qualquer erro era "engolido" e o Actions mostrava verde.
+    if not ok:
+        log("### Finalizando com erro (exit 1) ###")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
